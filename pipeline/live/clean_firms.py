@@ -1,84 +1,94 @@
-import os
-from pathlib import Path
-
 import pandas as pd
-from dotenv import load_dotenv
-from sqlalchemy import create_engine, text
-
+from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 
-load_dotenv(BASE_DIR / ".env")
+RAW_DIR = BASE_DIR / "data" / "live_raw"
+OUTPUT_DIR = BASE_DIR / "data" / "live_clean"
 
-DATABASE_URL = os.getenv(
-    "DATABASE_URL",
-    "postgresql://paridhilalwani@localhost:5432/sih26_ntro_db"
-)
-
-engine = create_engine(DATABASE_URL)
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def clean_firms_data():
+def find_latest_raw_file():
+    files = sorted(RAW_DIR.glob("firms_*.csv"))
 
-    query = """
-        SELECT
-            id,
-            latitude,
-            longitude,
-            brightness,
-            scan,
-            track,
-            acq_date,
-            acq_time,
-            satellite,
-            instrument,
-            confidence,
-            version,
-            bright_t31,
-            frp,
-            daynight,
-            cluster_id,
-            received_at,
-            source,
-            event_hash
-        FROM firms_raw_data
-    """
+    if not files:
+        raise FileNotFoundError("No raw FIRMS poll file found.")
 
-    with engine.connect() as conn:
-        df = pd.read_sql(text(query), conn)
+    return files[-1]
 
-    print("=" * 65)
-    print("FIRMS CLEANING STAGE")
-    print("=" * 65)
 
-    print(f"Raw rows: {len(df)}")
+def run_cleaning():
+
+    print("=" * 70)
+    print("LIVE FIRMS CLEANING")
+    print("=" * 70)
+
+    input_file = find_latest_raw_file()
+
+    print(f"Raw input: {input_file}")
+
+    df = pd.read_csv(input_file)
+
+    print(f"Raw detections: {len(df)}")
 
     if df.empty:
-        print("No raw FIRMS data available.")
-        return
+        raise ValueError("Latest FIRMS file is empty.")
 
-    # Remove exact duplicate events
-    before = len(df)
+    # Normalize column names
+    df.columns = [
+        c.strip().lower()
+        for c in df.columns
+    ]
 
-    df = df.drop_duplicates(
-        subset=["event_hash"]
-    ).copy()
+    # FIRMS NRT compatibility
+    if "bright_ti4" in df.columns:
+        df["brightness"] = df["bright_ti4"]
 
-    duplicates_removed = before - len(df)
+    if "bright_ti5" in df.columns:
+        df["bright_t31"] = df["bright_ti5"]
 
-    # Remove invalid coordinates
-    before = len(df)
+    # Required columns
+    required = [
+        "latitude",
+        "longitude",
+        "acq_date",
+        "frp"
+    ]
 
-    df = df[
-        df["latitude"].between(-90, 90)
-        & df["longitude"].between(-180, 180)
-    ].copy()
+    missing = [
+        c for c in required
+        if c not in df.columns
+    ]
 
-    invalid_coordinates = before - len(df)
+    if missing:
+        raise ValueError(
+            f"Missing required columns: {missing}"
+        )
 
-    # Remove rows without essential fire information
-    before = len(df)
+    # Numeric conversion
+    for col in [
+        "latitude",
+        "longitude",
+        "brightness",
+        "bright_t31",
+        "frp",
+        "scan",
+        "track"
+    ]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(
+                df[col],
+                errors="coerce"
+            )
 
+    # Date
+    df["acq_date"] = pd.to_datetime(
+        df["acq_date"],
+        errors="coerce"
+    ).dt.date
+
+    # Remove invalid rows
     df = df.dropna(
         subset=[
             "latitude",
@@ -86,50 +96,63 @@ def clean_firms_data():
             "acq_date",
             "frp"
         ]
-    ).copy()
-
-    missing_removed = before - len(df)
-
-    # Ensure numeric values
-    numeric_columns = [
-        "latitude",
-        "longitude",
-        "brightness",
-        "scan",
-        "track",
-        "acq_time",
-        "bright_t31",
-        "frp"
-    ]
-
-    for column in numeric_columns:
-        df[column] = pd.to_numeric(
-            df[column],
-            errors="coerce"
-        )
-
-    # FRP must be non-negative
-    before = len(df)
+    )
 
     df = df[
-        df["frp"].notna()
-        & (df["frp"] >= 0)
-    ].copy()
+        (df["latitude"] >= -90) &
+        (df["latitude"] <= 90) &
+        (df["longitude"] >= -180) &
+        (df["longitude"] <= 180)
+    ]
 
-    invalid_frp = before - len(df)
+    df = df[df["frp"] >= 0]
 
-    df = df.reset_index(drop=True)
+    # --------------------------------------------------------
+    # Create stable event hash
+    # --------------------------------------------------------
+    # The same FIRMS detection must receive the same hash
+    # across repeated 3-hour polls so PostgreSQL can deduplicate
+    # historical detections safely.
 
-    # Save cleaned backup
-    output_dir = BASE_DIR / "data" / "live_clean"
-    output_dir.mkdir(
-        parents=True,
-        exist_ok=True
+    import hashlib
+
+    def make_event_hash(row):
+        values = [
+            row.get("latitude"),
+            row.get("longitude"),
+            row.get("acq_date"),
+            row.get("acq_time"),
+            row.get("satellite"),
+            row.get("instrument")
+        ]
+
+        raw = "|".join(
+            "" if pd.isna(v) else str(v)
+            for v in values
+        )
+
+        return hashlib.sha256(
+            raw.encode("utf-8")
+        ).hexdigest()
+
+    if "event_hash" not in df.columns:
+        df["event_hash"] = df.apply(
+            make_event_hash,
+            axis=1
+        )
+
+    # Remove duplicate FIRMS events
+    df = df.drop_duplicates(
+        subset=["event_hash"]
+    )
+
+    timestamp = pd.Timestamp.now().strftime(
+        "%Y%m%d_%H%M%S"
     )
 
     output_file = (
-        output_dir
-        / f"firms_clean_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        OUTPUT_DIR /
+        f"firms_clean_{timestamp}.csv"
     )
 
     df.to_csv(
@@ -137,17 +160,12 @@ def clean_firms_data():
         index=False
     )
 
-    print(f"Duplicates removed: {duplicates_removed}")
-    print(f"Invalid coordinates removed: {invalid_coordinates}")
-    print(f"Missing essential values removed: {missing_removed}")
-    print(f"Invalid FRP rows removed: {invalid_frp}")
-    print(f"Clean rows: {len(df)}")
-    print(f"Clean backup: {output_file}")
+    print(f"Clean detections: {len(df)}")
+    print(f"Saved: {output_file}")
+    print("=" * 70)
 
-    print("=" * 65)
-    print("FIRMS CLEANING COMPLETE")
-    print("=" * 65)
+    return output_file
 
 
 if __name__ == "__main__":
-    clean_firms_data()
+    run_cleaning()

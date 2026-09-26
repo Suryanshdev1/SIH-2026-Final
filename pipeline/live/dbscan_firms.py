@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+import glob
 
 import pandas as pd
 from sklearn.cluster import DBSCAN
@@ -18,48 +19,50 @@ DATABASE_URL = os.getenv(
 
 engine = create_engine(DATABASE_URL)
 
-# Same parameters as the existing proven pipeline
 EPS = 0.01
 MIN_SAMPLES = 2
+
+CLEAN_DIR = BASE_DIR / "data" / "live_clean"
+OUTPUT_DIR = BASE_DIR / "data" / "live_clustered"
+
+OUTPUT_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+
+def find_latest_clean_file():
+
+    files = sorted(
+        CLEAN_DIR.glob("firms_clean_*.csv")
+    )
+
+    if not files:
+        raise FileNotFoundError(
+            "No cleaned FIRMS file found."
+        )
+
+    return files[-1]
 
 
 def run_dbscan():
 
-    query = """
-        SELECT
-            id,
-            latitude,
-            longitude,
-            brightness,
-            scan,
-            track,
-            acq_date,
-            acq_time,
-            satellite,
-            instrument,
-            confidence,
-            version,
-            bright_t31,
-            frp,
-            daynight,
-            event_hash
-        FROM firms_raw_data
-        WHERE latitude IS NOT NULL
-          AND longitude IS NOT NULL
-    """
-
-    with engine.connect() as conn:
-        df = pd.read_sql(text(query), conn)
-
-    print("=" * 65)
+    print("=" * 70)
     print("LIVE FIRMS DBSCAN")
-    print("=" * 65)
+    print("=" * 70)
+
+    input_file = find_latest_clean_file()
+
+    print(f"Clean input: {input_file}")
+
+    df = pd.read_csv(input_file)
 
     print(f"Input detections: {len(df)}")
 
     if df.empty:
-        print("No data available for DBSCAN.")
-        return
+        raise ValueError(
+            "Latest cleaned FIRMS file is empty."
+        )
 
     coordinates = df[
         ["latitude", "longitude"]
@@ -71,12 +74,19 @@ def run_dbscan():
         metric="euclidean"
     )
 
-    labels = dbscan.fit_predict(coordinates)
+    labels = dbscan.fit_predict(
+        coordinates
+    )
 
     df["cluster_id"] = labels
 
-    clustered = df[df["cluster_id"] != -1].copy()
-    noise = df[df["cluster_id"] == -1].copy()
+    clustered = df[
+        df["cluster_id"] != -1
+    ].copy()
+
+    noise = df[
+        df["cluster_id"] == -1
+    ].copy()
 
     clusters_found = (
         clustered["cluster_id"].nunique()
@@ -90,32 +100,42 @@ def run_dbscan():
     print(f"Clustered detections: {len(clustered)}")
     print(f"Noise/unclustered: {len(noise)}")
 
-    # Update cluster_id in the raw database
+    # ---------------------------------------------------------
+    # Update cluster IDs ONLY for this current batch
+    # ---------------------------------------------------------
+
     with engine.begin() as conn:
 
         for _, row in df.iterrows():
+
+            event_hash = row.get(
+                "event_hash"
+            )
+
+            if pd.isna(event_hash):
+                continue
 
             conn.execute(
                 text("""
                     UPDATE firms_raw_data
                     SET cluster_id = :cluster_id
-                    WHERE id = :id
+                    WHERE event_hash = :event_hash
                 """),
                 {
-                    "cluster_id": int(row["cluster_id"]),
-                    "id": int(row["id"])
+                    "cluster_id":
+                        int(row["cluster_id"]),
+                    "event_hash":
+                        str(event_hash)
                 }
             )
 
-    output_dir = BASE_DIR / "data" / "live_clustered"
-    output_dir.mkdir(
-        parents=True,
-        exist_ok=True
+    timestamp = pd.Timestamp.now().strftime(
+        "%Y%m%d_%H%M%S"
     )
 
     output_file = (
-        output_dir
-        / f"firms_clustered_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        OUTPUT_DIR
+        / f"firms_clustered_{timestamp}.csv"
     )
 
     df.to_csv(
@@ -125,9 +145,9 @@ def run_dbscan():
 
     print(f"Clustered backup: {output_file}")
 
-    print("=" * 65)
+    print("=" * 70)
     print("LIVE DBSCAN COMPLETE")
-    print("=" * 65)
+    print("=" * 70)
 
 
 if __name__ == "__main__":

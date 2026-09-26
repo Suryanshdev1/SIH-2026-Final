@@ -4,14 +4,15 @@ from datetime import datetime
 
 BASE_DIR = Path(__file__).resolve().parents[2]
 
-PERSISTENCE_FILE = BASE_DIR / "data/live_persistence/firms_persistence_20260926_005606.csv"
-CLUSTERED_FILE = BASE_DIR / "data/live_clustered/firms_clustered_20260926_005047.csv"
-WORLDCOVER_FILE = BASE_DIR / "data/live_worldcover/firms_worldcover_20260926_005939.csv"
-PROXIMITY_FILE = BASE_DIR / "data/live_industrial_proximity/firms_industrial_proximity_20260926_010526.csv"
-
+PERSISTENCE_DIR = BASE_DIR / "data/live_persistence"
+WORLDCOVER_DIR = BASE_DIR / "data/live_worldcover"
+OSM_DIR = BASE_DIR / "data/live_osm"
+INDUSTRIAL_DIR = BASE_DIR / "data/live_industrial_proximity"
 OUTPUT_DIR = BASE_DIR / "data/live_ml_input"
 
-FINAL_COLUMNS = [
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+EXPECTED_COLUMNS = [
     "detection_count",
     "mean_frp",
     "max_frp",
@@ -45,77 +46,93 @@ FINAL_COLUMNS = [
 ]
 
 
-def main():
+def latest_file(directory, pattern):
+    files = sorted(directory.glob(pattern), key=lambda p: p.stat().st_mtime)
+    if not files:
+        raise FileNotFoundError(
+            f"No files found in {directory} matching {pattern}"
+        )
+    return files[-1]
 
+
+def main():
     print("=" * 70)
     print("BUILD LIVE 30-COLUMN ML INPUT")
     print("=" * 70)
 
-    persistence = pd.read_csv(PERSISTENCE_FILE)
-    clustered = pd.read_csv(CLUSTERED_FILE)
-    worldcover = pd.read_csv(WORLDCOVER_FILE)
-    proximity = pd.read_csv(PROXIMITY_FILE)
-
-    print(f"Persistence rows: {len(persistence)}")
-    print(f"Clustered FIRMS rows: {len(clustered)}")
-    print(f"WorldCover rows: {len(worldcover)}")
-    print(f"Proximity rows: {len(proximity)}")
-
-    # ---------------------------------------------------------
-    # Raw FIRMS aggregate features per cluster
-    # ---------------------------------------------------------
-
-    clustered["frp"] = pd.to_numeric(
-        clustered["frp"],
-        errors="coerce"
+    persistence_file = latest_file(
+        PERSISTENCE_DIR, "firms_persistence_*.csv"
     )
 
-    clustered["brightness"] = pd.to_numeric(
-        clustered["brightness"],
-        errors="coerce"
+    worldcover_file = latest_file(
+        WORLDCOVER_DIR, "*.csv"
     )
 
-    firms_features = (
-        clustered[clustered["cluster_id"] >= 0]
-        .groupby("cluster_id")
-        .agg(
-            mean_frp=("frp", "mean"),
-            max_frp=("frp", "max"),
-            mean_brightness=("brightness", "mean"),
-            max_brightness=("brightness", "max"),
+    industrial_file = latest_file(
+        INDUSTRIAL_DIR, "*.csv"
+    )
+
+    print(f"Persistence : {persistence_file.name}")
+    print(f"WorldCover  : {worldcover_file.name}")
+    print(f"Industrial  : {industrial_file.name}")
+
+    persistence = pd.read_csv(persistence_file)
+    worldcover = pd.read_csv(worldcover_file)
+    industrial = pd.read_csv(industrial_file)
+
+    print(f"\nPersistence rows: {len(persistence)}")
+    print(f"WorldCover rows : {len(worldcover)}")
+    print(f"Industrial rows : {len(industrial)}")
+
+    # ------------------------------------------------------------
+    # Normalize coordinate column names
+    # ------------------------------------------------------------
+    for df in [persistence, worldcover, industrial]:
+        if "centroid_lat" not in df.columns:
+            if "latitude" in df.columns:
+                df["centroid_lat"] = df["latitude"]
+
+        if "centroid_lon" not in df.columns:
+            if "longitude" in df.columns:
+                df["centroid_lon"] = df["longitude"]
+
+    # ------------------------------------------------------------
+    # Merge WorldCover using cluster_id when available.
+    # Otherwise use nearest centroid.
+    # ------------------------------------------------------------
+    if "cluster_id" in worldcover.columns and "cluster_id" in persistence.columns:
+        wc_cols = [
+            c for c in worldcover.columns
+            if c in [
+                "cluster_id",
+                "land_cover_code",
+                "is_cropland",
+                "is_tree_cover",
+                "is_built_up",
+                "cropland_percentage",
+                "tree_cover_percentage",
+                "built_up_percentage",
+                "grassland_percentage",
+                "shrubland_percentage",
+                "bare_sparse_percentage",
+            ]
+        ]
+
+        worldcover_small = worldcover[wc_cols].drop_duplicates("cluster_id")
+
+        merged = persistence.merge(
+            worldcover_small,
+            on="cluster_id",
+            how="left",
+            suffixes=("", "_wc")
         )
-        .reset_index()
-    )
+    else:
+        merged = persistence.copy()
 
-    print(f"FIRMS feature clusters: {len(firms_features)}")
-
-    # ---------------------------------------------------------
-    # Persistence features
-    # ---------------------------------------------------------
-
-    persistence_cols = [
-        "cluster_id",
-        "detection_count",
-        "unique_detection_days",
-        "observation_window_days",
-        "spatial_spread_km",
-        "temporal_recurrence",
-        "duration_score",
-        "detection_frequency",
-        "spatial_consistency",
-        "persistence_score",
-        "centroid_lat",
-        "centroid_lon",
-    ]
-
-    persistence = persistence[persistence_cols].copy()
-
-    # ---------------------------------------------------------
-    # WorldCover
-    # ---------------------------------------------------------
-
-    worldcover_cols = [
-        "cluster_id",
+    # ------------------------------------------------------------
+    # Add WorldCover fields if they are not already present
+    # ------------------------------------------------------------
+    wc_fields = [
         "land_cover_code",
         "is_cropland",
         "is_tree_cover",
@@ -128,138 +145,132 @@ def main():
         "bare_sparse_percentage",
     ]
 
-    worldcover = worldcover[worldcover_cols].copy()
+    for col in wc_fields:
+        if col not in merged.columns:
+            merged[col] = 0
 
-    # ---------------------------------------------------------
-    # Industrial proximity
-    # ---------------------------------------------------------
+    # ------------------------------------------------------------
+    # Merge industrial proximity
+    # ------------------------------------------------------------
+    if "cluster_id" in industrial.columns and "cluster_id" in merged.columns:
+        ind_cols = [
+            c for c in industrial.columns
+            if c in [
+                "cluster_id",
+                "nearest_industrial_distance_km",
+                "nearby_industrial_facility_count",
+                "nearby_industrial_capacity_mw",
+            ]
+        ]
 
-    proximity_cols = [
-        "cluster_id",
+        industrial_small = industrial[ind_cols].drop_duplicates("cluster_id")
+
+        merged = merged.merge(
+            industrial_small,
+            on="cluster_id",
+            how="left",
+            suffixes=("", "_ind")
+        )
+
+    ind_fields = [
         "nearest_industrial_distance_km",
         "nearby_industrial_facility_count",
         "nearby_industrial_capacity_mw",
     ]
 
-    proximity = proximity[proximity_cols].copy()
+    for col in ind_fields:
+        if col not in merged.columns:
+            merged[col] = 0
 
-    # ---------------------------------------------------------
-    # Merge everything
-    # ---------------------------------------------------------
+    # ------------------------------------------------------------
+    # Resolve duplicate suffixed columns
+    # ------------------------------------------------------------
+    for col in EXPECTED_COLUMNS:
+        alt_wc = f"{col}_wc"
+        alt_ind = f"{col}_ind"
 
-    df = persistence.merge(
-        firms_features,
-        on="cluster_id",
-        how="left",
-        validate="one_to_one"
-    )
+        if col not in merged.columns:
+            if alt_wc in merged.columns:
+                merged[col] = merged[alt_wc]
+            elif alt_ind in merged.columns:
+                merged[col] = merged[alt_ind]
 
-    df = df.merge(
-        worldcover,
-        on="cluster_id",
-        how="left",
-        validate="one_to_one"
-    )
+        if alt_wc in merged.columns:
+            merged[col] = merged[col].fillna(merged[alt_wc])
 
-    df = df.merge(
-        proximity,
-        on="cluster_id",
-        how="left",
-        validate="one_to_one"
-    )
+        if alt_ind in merged.columns:
+            merged[col] = merged[col].fillna(merged[alt_ind])
 
-    # Live FIRMS detections are not yet classified.
-    df["fire_class"] = "UNKNOWN"
+    # ------------------------------------------------------------
+    # Fire class
+    # ------------------------------------------------------------
+    if "fire_class" not in merged.columns:
+        merged["fire_class"] = "UNKNOWN"
 
-    # ---------------------------------------------------------
-    # Exact 30-column order
-    # ---------------------------------------------------------
-
-    df = df[FINAL_COLUMNS]
-
-    # ---------------------------------------------------------
-    # Numeric conversion
-    # ---------------------------------------------------------
-
+    # ------------------------------------------------------------
+    # Numeric cleanup
+    # ------------------------------------------------------------
     numeric_columns = [
-        column
-        for column in FINAL_COLUMNS
-        if column != "fire_class"
+        c for c in EXPECTED_COLUMNS
+        if c not in ["fire_class"]
     ]
 
-    for column in numeric_columns:
-        df[column] = pd.to_numeric(
-            df[column],
+    for col in numeric_columns:
+        merged[col] = pd.to_numeric(
+            merged[col],
             errors="coerce"
         )
 
-    # ---------------------------------------------------------
-    # Validation
-    # ---------------------------------------------------------
+    # Keep fire class as string
+    merged["fire_class"] = merged["fire_class"].fillna("UNKNOWN").astype(str)
 
-    print()
-    print("=" * 70)
-    print("VALIDATION")
-    print("=" * 70)
+    # ------------------------------------------------------------
+    # Fill missing numeric values
+    # ------------------------------------------------------------
+    merged[numeric_columns] = merged[numeric_columns].fillna(0)
 
-    print(f"Rows: {len(df)}")
-    print(f"Columns: {len(df.columns)}")
+    # ------------------------------------------------------------
+    # Exact 30-column contract
+    # ------------------------------------------------------------
+    missing = [c for c in EXPECTED_COLUMNS if c not in merged.columns]
 
-    print()
-    print("Missing values:")
-
-    missing = df.isna().sum()
-
-    if missing.sum() == 0:
-        print("NONE")
-    else:
-        print(missing[missing > 0].to_string())
-
-    if len(df.columns) != 30:
+    if missing:
         raise ValueError(
-            f"Expected 30 columns, got {len(df.columns)}"
+            f"Missing required ML columns: {missing}"
         )
 
-    if list(df.columns) != FINAL_COLUMNS:
-        raise ValueError(
-            "Column order does not match exact 30-column schema."
-        )
+    output = merged[EXPECTED_COLUMNS].copy()
 
-    # ---------------------------------------------------------
-    # Save
-    # ---------------------------------------------------------
+    # Remove accidental duplicate rows
+    output = output.drop_duplicates()
 
-    OUTPUT_DIR.mkdir(
-        parents=True,
-        exist_ok=True
-    )
-
-    timestamp = datetime.now().strftime(
-        "%Y%m%d_%H%M%S"
-    )
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     output_file = (
         OUTPUT_DIR /
-        f"live_30_attributes_{timestamp}.csv"
+        f"firms_ml_input_{timestamp}.csv"
     )
 
-    df.to_csv(
-        output_file,
-        index=False
-    )
+    output.to_csv(output_file, index=False)
 
-    print()
+    print("\n" + "=" * 70)
+    print("LIVE ML INPUT COMPLETE")
     print("=" * 70)
-    print("LIVE 30-COLUMN ML INPUT COMPLETE")
-    print("=" * 70)
+    print(f"Rows    : {len(output)}")
+    print(f"Columns : {len(output.columns)}")
+    print(f"Output  : {output_file}")
+    print("\nColumn validation:")
 
-    print(f"Output: {output_file}")
-    print(f"Shape: {df.shape}")
+    if list(output.columns) == EXPECTED_COLUMNS:
+        print("✓ EXACT 30-COLUMN CONTRACT")
+    else:
+        print("✗ COLUMN CONTRACT MISMATCH")
+        print(list(output.columns))
+        raise ValueError("ML input column order mismatch")
 
-    print()
-    print(df.to_string(index=False))
+    print("\nMissing values:")
+    print(int(output.isna().sum().sum()))
 
-    print()
     print("=" * 70)
 
 
