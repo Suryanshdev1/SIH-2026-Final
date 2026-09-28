@@ -13,6 +13,7 @@ interface MapViewProps {
 }
 
 export function MapView({ clusters, selectedClusterId, onSelectCluster }: MapViewProps) {
+  console.log("📡 Frontend Map Clusters:", clusters); // YEH NAYI LINE DAAL
   const containerRef = useRef<HTMLDivElement | null>(null);
   const mapRef = useRef<MapLibreMap | null>(null);
   const markersRef = useRef<Map<string, Marker>>(new Map());
@@ -35,8 +36,6 @@ export function MapView({ clusters, selectedClusterId, onSelectCluster }: MapVie
     });
 
     map.addControl(new maplibregl.NavigationControl({ showCompass: false }), 'top-right');
-    // OpenFreeMap's own credit already arrives via the vector source's
-    // TileJSON; the raster/DEM sources carry theirs in the style.
     map.addControl(new maplibregl.AttributionControl({ compact: true }));
 
     map.on('load', () => {
@@ -72,11 +71,16 @@ export function MapView({ clusters, selectedClusterId, onSelectCluster }: MapVie
     clusters.forEach((cluster) => {
       const existing = markersRef.current.get(cluster.cluster_id);
       const isSelected = cluster.cluster_id === selectedClusterId;
+      
+      // ✅ Check if this is our dummy ESP32 ground node
+      const isGroundNode = cluster.cluster_id === 'NODE_SMB_01';
+      const markerColor = isGroundNode ? '#3b82f6' : riskDotColor(cluster.risk_level);
 
       if (existing) {
         const el = existing.getElement();
-        el.style.setProperty('--marker-color', riskDotColor(cluster.risk_level));
+        el.style.setProperty('--marker-color', markerColor);
         el.classList.toggle('is-selected', isSelected);
+        if (isGroundNode) el.classList.add('is-ground-node');
         return;
       }
 
@@ -84,8 +88,10 @@ export function MapView({ clusters, selectedClusterId, onSelectCluster }: MapVie
       el.type = 'button';
       el.setAttribute('aria-label', `Cluster ${cluster.cluster_id}, ${cluster.risk_level} risk`);
       el.className = 'ts-marker';
-      el.style.setProperty('--marker-color', riskDotColor(cluster.risk_level));
+      el.style.setProperty('--marker-color', markerColor);
+      
       if (isSelected) el.classList.add('is-selected');
+      if (isGroundNode) el.classList.add('is-ground-node'); // ✅ Blue marker class
 
       el.addEventListener('mouseenter', () => {
         showHoverPopup(map, popupRef, popupRootRef, cluster);
@@ -98,8 +104,12 @@ export function MapView({ clusters, selectedClusterId, onSelectCluster }: MapVie
         onSelectCluster(cluster.cluster_id);
       });
 
+      // ✅ Use lat/lon directly for ground node, otherwise use centroid
+      const lng = cluster.centroid.lon;
+      const lat = cluster.centroid.lat;
+
       const marker = new maplibregl.Marker({ element: el, anchor: 'center' })
-        .setLngLat([cluster.centroid.lon, cluster.centroid.lat])
+        .setLngLat([lng, lat])
         .addTo(map);
 
       markersRef.current.set(cluster.cluster_id, marker);
@@ -107,20 +117,22 @@ export function MapView({ clusters, selectedClusterId, onSelectCluster }: MapVie
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [clusters, mapReady, selectedClusterId]);
 
-  // Smoothly fly to the selected cluster. Kept as its own effect (rather
-  // than folded into marker sync above) so it fires only when the
-  // selection itself changes — not on every filter-driven cluster list
-  // update — and `clusters` is intentionally left out of the dependency
-  // array for the same reason.
+  // Smoothly fly to the selected cluster.
   useEffect(() => {
     const map = mapRef.current;
     if (!map || !mapReady || !selectedClusterId) return;
 
     const target = clusters.find((c) => c.cluster_id === selectedClusterId);
     if (!target) return;
+    
+    // YAHAN FIX KIYA HAI: 'cluster' ki jagah 'target' use karna hai
+    const isGroundNode = target.cluster_id === 'NODE_SMB_01';
+    
+    const lng = target.centroid.lon;
+    const lat = target.centroid.lat;
 
     map.flyTo({
-      center: [target.centroid.lon, target.centroid.lat],
+      center: [lng, lat],
       zoom: Math.max(map.getZoom(), 4.5),
       speed: 0.9,
       curve: 1.4,
@@ -142,7 +154,7 @@ export function MapView({ clusters, selectedClusterId, onSelectCluster }: MapVie
           box-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
           cursor: pointer;
           padding: 0;
-          transition: transform 120ms ease;
+          transition: transform 120ms ease, box-shadow 120ms ease;
         }
         .ts-marker:hover {
           transform: scale(1.4);
@@ -150,6 +162,20 @@ export function MapView({ clusters, selectedClusterId, onSelectCluster }: MapVie
         .ts-marker.is-selected {
           box-shadow: 0 0 0 3px rgba(230, 57, 70, 0.4);
           transform: scale(1.3);
+        }
+        /* ✅ Special styling for ESP32 Ground Node */
+        .ts-marker.is-ground-node {
+          border: 2px solid #ffffff;
+          box-shadow: 0 0 8px rgba(59, 130, 246, 0.8), 0 0 0 3px rgba(59, 130, 246, 0.3);
+          animation: pulse-blue 2s infinite;
+        }
+        .ts-marker.is-ground-node.is-selected {
+          box-shadow: 0 0 0 4px rgba(59, 130, 246, 0.5);
+        }
+        @keyframes pulse-blue {
+          0% { box-shadow: 0 0 0 0 rgba(59, 130, 246, 0.7); }
+          70% { box-shadow: 0 0 0 6px rgba(59, 130, 246, 0); }
+          100% { box-shadow: 0 0 0 0 rgba(59, 130, 246, 0); }
         }
       `}</style>
     </div>
@@ -162,7 +188,6 @@ function closeHoverPopup(
 ) {
   popupRef.current?.remove();
   popupRef.current = null;
-  // Defer unmount so React doesn't warn about unmounting mid-render.
   const rootToUnmount = popupRootRef.current;
   popupRootRef.current = null;
   if (rootToUnmount) {
@@ -178,9 +203,13 @@ function showHoverPopup(
 ) {
   closeHoverPopup(popupRef, popupRootRef);
 
+  const isGroundNode = cluster.cluster_id === 'NODE_SMB_01';
+  const lng = cluster.centroid.lon;
+  const lat = cluster.centroid.lat;
+
   const container = document.createElement('div');
   const popup = new maplibregl.Popup({ closeButton: false, closeOnClick: false, offset: 14 })
-    .setLngLat([cluster.centroid.lon, cluster.centroid.lat])
+    .setLngLat([lng, lat])
     .setDOMContent(container)
     .addTo(map);
 

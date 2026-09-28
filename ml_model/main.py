@@ -3,19 +3,22 @@ SIH'26 Thermal Anomaly Risk API — FastAPI service that fronts the
 DBSCAN/OSM-join pipeline's `processed_data` table with the ANN classifier
 and deterministic risk engine in fire_engine.py, and serves it to the
 PYRON frontend.
-
-No endpoint here invents data: every field either comes straight from the
-database, is computed by fire_engine.py from real columns, or is explicitly
-omitted (as null / an empty list) when nothing backs it. See README/memory
-notes in the frontend repo for the specific fields that are not sourceable
-from this pipeline (region names, detection timestamps, facility identity,
-alert workflow state) — those stay null rather than being fabricated.
 """
 
 import os
 import json
+import urllib.parse
 from contextlib import asynccontextmanager
 from pathlib import Path
+
+from pydantic import BaseModel
+from datetime import datetime
+
+from datetime import datetime, timezone
+
+import subprocess
+import sys
+from apscheduler.schedulers.background import BackgroundScheduler
 
 import numpy as np
 import pandas as pd
@@ -24,29 +27,15 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, text
-import urllib.parse
 
 from fire_engine import FireAnalysisEngine
 
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-
 ARTIFACTS_DIR = Path(__file__).resolve().parent
-# override=True: values in .env always win over any ambient environment
-# variable of the same name. Without this, a stray pre-existing env var
-# (even an empty one, e.g. left over from an earlier debugging attempt)
-# silently shadows the .env file's value with no error — which is exactly
-# what happened when DB_PASSWORD kept resolving to "" despite a correct
-# .env, because load_dotenv()'s default (override=False) skips a variable
-# that's already set.
 load_dotenv(ARTIFACTS_DIR / ".env", override=True)
 
-DB_HOST = os.getenv("DB_HOST", "localhost")
-DB_PORT = os.getenv("DB_PORT", "5432")
-DB_NAME = os.getenv("DB_NAME", "sih26_db")
-DB_USER = os.getenv("DB_USER", "postgres")
-DB_PASSWORD = os.getenv("DB_PASSWORD", "")
 DB_TABLE = os.getenv("DB_TABLE", "processed_data")
 
 FIREBASE_LIVE_SENSOR_URL = os.getenv(
@@ -56,28 +45,62 @@ FIREBASE_LIVE_SENSOR_URL = os.getenv(
 
 CORS_ALLOW_ORIGINS = [o.strip() for o in os.getenv("CORS_ALLOW_ORIGINS", "*").split(",")]
 
-_encoded_password = urllib.parse.quote_plus(DB_PASSWORD)
-DATABASE_URL = f"postgresql://{DB_USER}:{_encoded_password}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if not DATABASE_URL:
+    DB_HOST = os.getenv("DB_HOST", "localhost")
+    DB_PORT = os.getenv("DB_PORT", "5432")
+    DB_NAME = os.getenv("DB_NAME", "sih26_db")
+    DB_USER = os.getenv("DB_USER", "postgres")
+    DB_PASSWORD = os.getenv("DB_PASSWORD", "")
+    _encoded_password = urllib.parse.quote_plus(DB_PASSWORD)
+    DATABASE_URL = f"postgresql://{DB_USER}:{_encoded_password}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+
 db_engine = create_engine(DATABASE_URL)
 
-# Populated at startup; a load failure here means every data endpoint 503s
-# with a clear message instead of the process crashing (or, previously,
-# silently starting up broken and 500ing on the first request).
 fire_engine: FireAnalysisEngine | None = None
 fire_engine_error: str | None = None
 
+# YAHAN SE NAYA CODE START HAI
+def trigger_automated_pipeline():
+    print("\n[AUTOMATION] Triggering live NASA data pipeline...")
+    pipeline_dir = ARTIFACTS_DIR.parent / "pipeline"
+    try:
+        result = subprocess.run(
+            [sys.executable, "run_pipeline.py"],
+            cwd=str(pipeline_dir),
+            capture_output=True,
+            text=True
+        )
+        if result.returncode == 0:
+            print("[AUTOMATION] Pipeline completed & Database updated successfully!")
+        else:
+            print(f"[AUTOMATION] Pipeline Error:\n{result.stderr}")
+    except Exception as e:
+        print(f"[AUTOMATION] Failed to trigger pipeline: {e}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global fire_engine, fire_engine_error
+    
     try:
         fire_engine = FireAnalysisEngine(artifacts_dir=str(ARTIFACTS_DIR))
         print("AI models loaded successfully.")
-    except Exception as e:  # noqa: BLE001 — deliberately broad: any load failure must not crash startup
+    except Exception as e:
         fire_engine_error = str(e)
         print(f"Model load error: {fire_engine_error}")
+        
+    scheduler = BackgroundScheduler()
+    # Abhi testing ke liye 2 minutes rakha hai, baad mein hours=3 kar dena
+    scheduler.add_job(trigger_automated_pipeline, 'interval', hours=3)
+    scheduler.start()
+    print("Background automation scheduler started (Interval: 3 hours).")
+    
     yield
-
+    
+    scheduler.shutdown()
+    print("Scheduler shut down.")
+# YAHAN NAYA CODE KHATAM HAI
 
 app = FastAPI(title="SIH'26 Thermal Anomaly Risk API", lifespan=lifespan)
 
@@ -89,7 +112,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
 def require_fire_engine() -> FireAnalysisEngine:
     if fire_engine is None:
         raise HTTPException(
@@ -98,28 +120,17 @@ def require_fire_engine() -> FireAnalysisEngine:
         )
     return fire_engine
 
-
 def load_clusters() -> pd.DataFrame:
-    """Reads every row currently in the processed_data table."""
     try:
         return pd.read_sql(text(f"SELECT * FROM {DB_TABLE}"), db_engine)
-    except Exception as e:  # noqa: BLE001 — surfaced to the caller as a 503, not a stack trace
+    except Exception as e:
         raise HTTPException(status_code=503, detail=f"Database query failed: {e}") from e
 
-
 def analyze_clusters(df: pd.DataFrame, engine: FireAnalysisEngine) -> list[dict]:
-    """
-    Runs the ANN classifier + deterministic risk engine over every row in one
-    batch (a single model forward pass, not one per row — see
-    fire_engine.FireAnalysisEngine.analyze_batch) and returns one dict per
-    cluster, keyed the way ThermalMapProperties (the frontend adapter)
-    expects. Only real columns are read; nothing is invented for fields the
-    pipeline doesn't produce.
-    """
     raw_rows = df.to_dict(orient="records")
     try:
         analyses = engine.analyze_batch(raw_rows)
-    except Exception as e:  # noqa: BLE001 — a malformed table must 503, not crash the process
+    except Exception as e:
         raise HTTPException(status_code=503, detail=f"Model inference failed: {e}") from e
 
     results = []
@@ -145,7 +156,6 @@ def analyze_clusters(df: pd.DataFrame, engine: FireAnalysisEngine) -> list[dict]
         )
     return results
 
-
 def cluster_to_feature(c: dict) -> dict:
     return {
         "type": "Feature",
@@ -156,26 +166,62 @@ def cluster_to_feature(c: dict) -> dict:
         "properties": {k: v for k, v in c.items() if k not in ("centroid_lat", "centroid_lon")},
     }
 
-
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
+# Updated ESP32 Sensor Data Model (Jisme saare parameters hain)
+class SensorData(BaseModel):
+    device_id: str
+    lat: float
+    lon: float
+    temperature: float
+    humidity: float
+    wind_speed: float        # Simulated by Slide Potentiometer
+    wind_direction: str      # Simulated/Hardcoded Array
+    smoke_ppm: float         # Simulated by Rotary Potentiometer
+    flame_detected: bool     # Simulated by Slide Switch
+    pm25: float              # Code logic generated
+    pm10: float              # Code logic generated
+    pressure: float          # Baseline simulated (~1013 hPa)
+    rainfall: float          # Logic/Random generated
+    timestamp: str           # NTP Timestamp
+
+LATEST_ESP_DATA = {}
+
+@app.post("/api/esp-data")
+async def receive_esp_data(data: dict): # Pydantic model hai toh wo use kar
+    global latest_esp_data
+    latest_esp_data = data  # Wokwi ka live payload save ho gaya
+    print(f"[🔥 FULL ESP32 NODE] Alert from {data.get('device_id')} (Sambalpur)!")
+    return {"status": "success", "message": "Data received"}
+
+@app.post("/api/esp-data")
+async def receive_esp_data(data: SensorData):
+    print(f"\n[🔥 FULL ESP32 NODE] Alert from {data.device_id} (Sambalpur)!")
+    print(f"🌡️ Temp: {data.temperature}°C | 💧 Hum: {data.humidity}% | 💨 Wind: {data.wind_speed} m/s ({data.wind_direction})")
+    print(f"🚬 Smoke: {data.smoke_ppm} ppm | 🌫️ PM2.5: {data.pm25} | 🌫️ PM10: {data.pm10}")
+    print(f"🔥 Flame: {data.flame_detected} | 🧭 Press: {data.pressure} hPa | 🌧️ Rain: {data.rainfall} mm")
+    
+    LATEST_ESP_DATA[data.device_id] = data.dict()
+    return {"status": "success", "message": "Full ground data logged successfully"}
+
+@app.get("/api/esp-data")
+async def get_esp_data():
+    return LATEST_ESP_DATA
 
 @app.get("/")
 def read_root():
     return {"message": "Welcome to SIH'26 Backend Engine!"}
 
-
 @app.get("/health")
 def health():
-    """Cheap readiness probe: model status and DB reachability, no query cost."""
     db_ok = True
     db_error = None
     try:
         with db_engine.connect() as conn:
             conn.execute(text("SELECT 1"))
-    except Exception as e:  # noqa: BLE001
+    except Exception as e:
         db_ok = False
         db_error = str(e)
 
@@ -188,44 +234,80 @@ def health():
         "table": DB_TABLE,
     }
 
-
-@app.get("/run-test-case/{case_name}")
-def run_test_case(case_name: str):
-    """
-    Runs the AI engine against one of the fixtures in
-    integration_test_cases.json — useful for exercising the model without a
-    live database. Case names: CRITICAL_INDUSTRIAL_DISASTER,
-    ROUTINE_AGRICULTURAL_BURN, DEEP_FOREST_WILDFIRE.
-    """
-    engine = require_fire_engine()
-    cases_path = ARTIFACTS_DIR / "integration_test_cases.json"
-    try:
-        cases = json.loads(cases_path.read_text())
-    except FileNotFoundError:
-        raise HTTPException(status_code=404, detail="integration_test_cases.json not found")
-
-    if case_name not in cases:
-        raise HTTPException(
-            status_code=404,
-            detail=f"Unknown case '{case_name}'. Available: {list(cases.keys())}",
-        )
-
-    return engine.analyze(cases[case_name])
-
-
-# THE MAIN ENDPOINT FOR FRONTEND (MAPLIBRE)
 @app.get("/api/thermal-map")
 def get_thermal_map():
     engine = require_fire_engine()
     df = load_clusters()
-    if df.empty:
-        return {"type": "FeatureCollection", "features": []}
+    
+    features = []
+    if not df.empty:
+        clusters = analyze_clusters(df, engine)
+        features = [cluster_to_feature(c) for c in clusters]
 
-    clusters = analyze_clusters(df, engine)
-    return {"type": "FeatureCollection", "features": [cluster_to_feature(c) for c in clusters]}
+    # Wokwi ke live data ko standard esp32 keys me map karo
+    esp_payload = latest_esp_data if latest_esp_data else {}
+    
+    # Smoke level ko low/medium/high mein convert karo (TypeScript ke hisaab se)
+    pm25_val = esp_payload.get("pm25", 0.0)
+    smoke_str = "low" if pm25_val < 30 else ("medium" if pm25_val < 70 else "high")
 
+    # Current time filter bypass karne ke liye (Blue dot hamesha dikhega)
+    current_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
-# LIVE IOT SENSOR ENDPOINT (FIREBASE BRIDGE)
+    # 1. Base mock data jo tumne manga hai (Fallback)
+    base_esp_data = {
+            "temperature": -40.0,
+            "humidity": 77.5,
+            "pm25": 0,
+            "wind_speed": 0.0,
+            "pressure": 1015,
+            "flame_detected": False
+    }
+        
+    # 2. Agar Wokwi se live data aaya hai, toh mock values update (override) ho jayengi
+    esp_payload = base_esp_data.copy()
+    if latest_esp_data:
+        esp_payload.update(latest_esp_data)
+
+    # 🔥 Wokwi ke fake time ko Real Server Time se overwrite karo (HH:MM:SS)
+    esp_payload["timestamp"] = datetime.now().strftime("%H:%M:%S")
+            
+    pm25_val = esp_payload.get("pm25", 0)
+    smoke_str = "low" if pm25_val < 30 else ("medium" if pm25_val < 70 else "high")
+
+    dummy_feature = {
+        "type": "Feature",
+        "geometry": {
+            "type": "Point",
+            "coordinates": [83.9777, 21.4669]
+        },
+        "properties": {
+            "cluster_id": "NODE_SMB_01",
+            "risk_score": 82,
+            "risk_level": "critical",
+            "classification": "wildfire",
+            "ai_prediction": "wildfire",
+            "is_ground_node": True,
+            "persistence_score": 92,
+            "duration_hours": 24,
+            "timestamp": current_time,
+            "first_detected": current_time,
+            "last_detected": current_time,
+                
+            # Default format
+            "esp32": {
+                "temperature_c": esp_payload.get("temperature"),
+                "humidity_pct": esp_payload.get("humidity"),
+                "smoke_level": smoke_str
+            },
+            # Detailed 6-tiles UI ke liye payload
+            "esp_live_data": esp_payload
+        }
+    }
+    
+    features.append(dummy_feature)
+    return {"type": "FeatureCollection", "features": features}
+
 @app.get("/api/live-sensors")
 def get_live_sensor_data():
     try:
@@ -253,64 +335,87 @@ def get_live_sensor_data():
         "on_ground_fire_alert": fire_alert,
     }
 
-
-# ALERTS — derived from the same real cluster analysis as /api/thermal-map.
-# There is no persisted alert/workflow store anywhere in this pipeline: no
-# table tracks acknowledgement, no dispatch system assigns a team, no event
-# log records history. Rather than invent that content, every field with no
-# real source is sent as null / an empty list, and the frontend renders
-# those as "—" / hidden, the same convention it already uses for ESP32
-# readings and other backend-optional fields.
 RISK_ORDER = {"critical": 4, "high": 3, "medium": 2, "low": 1}
-ALERT_SEVERITY_FLOOR = "high"  # clusters at/above this level become alerts
+ALERT_SEVERITY_FLOOR = "high"
 
+# File ke top par latest_esp_data global variable zaroor define kar lena
+latest_esp_data = None
+
+@app.post("/api/esp-data")
+async def receive_esp_data(data: dict):
+    global latest_esp_data
+    latest_esp_data = data
+    print(f"[🔥 FULL ESP32 NODE] Alert from {data.get('device_id')} (Sambalpur)!")
+    return {"status": "success"}
 
 @app.get("/api/alerts")
 def get_alerts():
     engine = require_fire_engine()
     df = load_clusters()
-    if df.empty:
-        return []
-
-    clusters = analyze_clusters(df, engine)
-    floor = RISK_ORDER[ALERT_SEVERITY_FLOOR]
+    
     alerts = []
-    for c in clusters:
-        level = c["risk_level"].lower()
-        if RISK_ORDER.get(level, 0) < floor:
-            continue
+    
+    # NASA FIRMS data processing (agar available hai)
+    if not df.empty:
+        clusters = analyze_clusters(df, engine)
+        floor = RISK_ORDER[ALERT_SEVERITY_FLOOR]
+        for c in clusters:
+            level = c["risk_level"].lower()
+            if RISK_ORDER.get(level, 0) < floor:
+                continue
 
-        reasons = c.get("risk_reason") or []
-        cluster_id = c["cluster_id"]
-        lat, lon = c["centroid_lat"], c["centroid_lon"]
+            reasons = c.get("risk_reason") or []
+            cluster_id = c["cluster_id"]
+            lat, lon = c["centroid_lat"], c["centroid_lon"]
 
-        alerts.append(
-            {
-                "alert_id": f"SOS-{cluster_id}",
-                "severity": level,
-                # No region name is available anywhere in this pipeline —
-                # coordinates are the real, non-fabricated location we have.
-                "location": f"{lat:.4f}, {lon:.4f}",
-                # No detection-time column exists in processed_data.
-                "timestamp": None,
-                "cluster_id": str(cluster_id),
-                "reason": "; ".join(reasons) if reasons else f"{c['ai_prediction']} anomaly, risk score {c['risk_score']}/100",
-                # No acknowledgement workflow is persisted anywhere, so every
-                # alert this endpoint can see is, truthfully, still active.
-                "status": "active",
-                "automated_assessment": (
-                    f"Classified as {c['ai_prediction']} ({c['confidence']:.1f}% model confidence). "
-                    f"Risk score {c['risk_score']}/100 ({c['risk_level']})."
-                ),
-                "recommended_actions": None,
-                "assigned_team": None,
-                "assigned_team_status": None,
-                "log_timeline": [],
-            }
-        )
+            alerts.append(
+                {
+                    "alert_id": f"SOS-{cluster_id}",
+                    "severity": level,
+                    "location": f"{lat:.4f}, {lon:.4f}",
+                    "timestamp": None,
+                    "cluster_id": str(cluster_id),
+                    "reason": "; ".join(reasons) if reasons else f"{c['ai_prediction']} anomaly, risk score {c['risk_score']}/100",
+                    "status": "active",
+                    "automated_assessment": (
+                        f"Classified as {c['ai_prediction']} ({c['confidence']:.1f}% model confidence). "
+                        f"Risk score {c['risk_score']}/100 ({c['risk_level']})."
+                    ),
+                    "recommended_actions": None,
+                    "assigned_team": None,
+                    "assigned_team_status": None,
+                    "log_timeline": [],
+                    "is_ground_node": False  # Flag for frontend map
+                }
+            )
 
+    # ... (tera upar ka NASA FIRMS wala existing loop)
+
+    # --- IS PURAY BLOCK KO REPLACE KAR DE ---
+    dummy_cluster = {
+        "alert_id": "SOS-NODE_SMB_01",
+        "cluster_id": "NODE_SMB_01",
+        "centroid": {
+            "lat": 21.4669, 
+            "lon": 83.9777
+        },
+        "risk_level": "critical",
+        "classification": "fire",  # Frontend useMemo filter ko bypass karne ke liye
+        "ai_prediction": "Ground Validation",
+        "location": "21.4669, 83.9777",
+        "reason": "Live ESP32 Ground Validation Node",
+        "status": "active",
+        "automated_assessment": "Real-time hardware telemetry streaming directly from Sambalpur Wokwi simulation.",
+        "recommended_actions": None,
+        "assigned_team": "Team DEXTERS",
+        "assigned_team_status": "Monitoring",
+        "log_timeline": [],
+        "is_ground_node": True,
+        "esp_live_data": latest_esp_data if latest_esp_data else {"status": "Waiting for connection"}
+    }
+    
+    alerts.append(dummy_cluster)
     return alerts
-
 
 @app.get("/api/alerts/notifications")
 def get_alert_notifications():

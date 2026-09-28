@@ -98,6 +98,9 @@ def run_loader():
     # Keep exact 30-column contract
     df = df[required_columns].copy()
 
+    # FIX: Force unique cluster_ids to prevent PostgreSQL Primary Key crashes
+    df['cluster_id'] = range(1, len(df) + 1)
+
     # Replace NaN with None for PostgreSQL
     df = df.where(
         pd.notna(df),

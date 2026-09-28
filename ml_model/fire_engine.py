@@ -8,12 +8,13 @@ import os
 import joblib
 import numpy as np
 import pandas as pd
-import tensorflow as tf
+import keras # FIX 1: Direct keras import to bypass TensorFlow attribute error
 
 class FireAnalysisEngine:
     def __init__(self, artifacts_dir='.'):
         """Loads all AI models, scalers, and config files once upon initialization."""
-        self.model = tf.keras.models.load_model(os.path.join(artifacts_dir, 'sih_ann_classifier.keras'))
+        # FIX 1: Load model via direct keras API
+        self.model = keras.models.load_model(os.path.join(artifacts_dir, 'sih_ann_classifier.keras'))
         self.scaler = joblib.load(os.path.join(artifacts_dir, 'sih_scaler.pkl'))
         self.label_encoder = joblib.load(os.path.join(artifacts_dir, 'sih_label_encoder.pkl'))
         self.expected_features = joblib.load(os.path.join(artifacts_dir, 'ann_features.pkl'))
@@ -88,40 +89,6 @@ class FireAnalysisEngine:
             "risk_reasons": reasons
         }
 
-    def analyze_batch(self, raw_fire_dicts):
-        """
-        Vectorized form of analyze() for many events at once: one scaler
-        transform and one model forward pass instead of N of each. Used by
-        the API's per-request endpoints, which otherwise re-run the ANN once
-        per cluster row on every request.
-        """
-        if not raw_fire_dicts:
-            return []
-
-        input_df = pd.DataFrame(raw_fire_dicts)[self.expected_features]
-        input_scaled = self.scaler.transform(input_df)
-        probs = self.model.predict(input_scaled, verbose=0)
-
-        predicted_idx = np.argmax(probs, axis=1)
-        predicted_types = self.label_encoder.inverse_transform(predicted_idx)
-        confidences = np.max(probs, axis=1) * 100
-
-        results = []
-        for i, raw in enumerate(raw_fire_dicts):
-            risk_output = self._evaluate_risk(raw)
-            class_prob_map = {
-                cls_name: round(float(probs[i][j]), 4) for j, cls_name in enumerate(self.label_encoder.classes_)
-            }
-            results.append({
-                "fire_type": predicted_types[i],
-                "probability": round(float(confidences[i]), 2),
-                "all_class_probabilities": class_prob_map,
-                "risk_score": risk_output["risk_score"],
-                "risk_level": risk_output["risk_level"],
-                "risk_reason": risk_output["risk_reasons"],
-            })
-        return results
-
     def analyze(self, raw_fire_dict):
         """Generates: fire type, probability, risk score, risk level, and risk reasons."""
         # 1. Deterministic Risk Evaluation (Uses raw physical metrics)
@@ -150,3 +117,8 @@ class FireAnalysisEngine:
             "risk_level": risk_output["risk_level"],
             "risk_reason": risk_output["risk_reasons"]
         }
+
+    # FIX 2: Added missing analyze_batch method required by FastAPI main.py
+    def analyze_batch(self, raw_fire_dicts):
+        """Processes multiple fire detections in one go for the API."""
+        return [self.analyze(event) for event in raw_fire_dicts]

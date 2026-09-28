@@ -21,23 +21,39 @@ export function useClusters(): UseClustersResult {
 
   useEffect(() => {
     let cancelled = false;
-    setStatus('loading');
-    setError(null);
 
-    fetchClusters()
-      .then((data) => {
-        if (cancelled) return;
-        setClusters(data);
-        setStatus('success');
-      })
-      .catch((err: unknown) => {
-        if (cancelled) return;
-        setError(err instanceof Error ? err.message : 'Failed to load thermal clusters.');
-        setStatus('error');
-      });
+    const loadData = (isBackgroundPoll = false) => {
+      // Pehli baar loading state dikhayenge, background refresh mein nahi
+      if (!isBackgroundPoll) {
+        setStatus('loading');
+        setError(null);
+      }
 
+      fetchClusters()
+        .then((data) => {
+          if (cancelled) return;
+          setClusters(data);
+          setStatus('success');
+        })
+        .catch((err: unknown) => {
+          if (cancelled) return;
+          setError(err instanceof Error ? err.message : 'Failed to load thermal clusters.');
+          setStatus('error');
+        });
+    };
+
+    // 1. Initial fetch (Loading screen ke saath)
+    loadData(false);
+
+    // 2. Har 5 second mein live Wokwi data background mein refresh hoga
+    const intervalId = setInterval(() => {
+      loadData(true);
+    }, 5000);
+
+    // 3. Cleanup function
     return () => {
       cancelled = true;
+      clearInterval(intervalId);
     };
   }, [reloadKey]);
 

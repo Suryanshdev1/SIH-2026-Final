@@ -1,12 +1,26 @@
-import { useClock, formatUtcClock } from '@/hooks/useClock';
+import { useState, useEffect } from 'react';
 import { ClockIcon } from './icons';
 import { SectionHeader } from '@/components/shared/SectionHeader';
 
-// Matches the Row 1 card pattern (icon tile + value + supporting lines)
-// used by CurrentSituationBanner and SosAlertCard, on the neutral card
-// surface. Still the same live UTC clock as before, just restyled.
 export function SystemClockCard() {
-  const clock = useClock();
+  const [clock, setClock] = useState(new Date());
+
+  // Har 1 second mein time ko live update karega
+  useEffect(() => {
+    const timer = setInterval(() => {
+      setClock(new Date());
+    }, 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  // Strict 24-hour UTC format (e.g., 14:35:09)
+  const timeString = clock.toLocaleTimeString('en-US', {
+    timeZone: 'UTC',
+    hour12: false,
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit'
+  });
 
   return (
     <div className="flex h-full flex-col gap-1.5">
@@ -17,7 +31,7 @@ export function SystemClockCard() {
         </span>
         <div className="min-w-0">
           <div className="whitespace-nowrap font-mono text-[24px] font-bold leading-none tabular-nums text-ink-100">
-            {formatUtcClock(clock)}
+            {timeString}
           </div>
           <div className="mt-2 font-mono text-[13px] leading-snug text-ink-300">
             {clock.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC' })}

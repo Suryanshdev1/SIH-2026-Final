@@ -183,11 +183,17 @@ export function toThermalCluster(feature: ThermalMapFeature): ThermalCluster {
 
     facility: toFacility(props),
 
-    // Ground telemetry is a separate, single-station endpoint
-    // (GET /api/live-sensors) and is not reported per cluster. Attaching one
-    // sensor's reading to every cluster would misrepresent where it was taken.
-    esp32: null,
-  };
+    // 🔥 YEHAAN DAALNA HAI: ESP32 aur live data ko map karne ke liye
+    esp32: (props as any).esp32 ? {
+      temperature_c: Number((props as any).esp32.temperature_c) || null,
+      humidity_pct: Number((props as any).esp32.humidity_pct) || null,
+      smoke_level: String((props as any).esp32.smoke_level) || null,
+    } : null,
+
+    // Yahan custom properties attach kar rahe hain taaki Component tak pahunche:
+    esp_live_data: (props as any).esp_live_data ?? null,
+    is_ground_node: (props as any).is_ground_node ?? false,
+  } as any; // Type casting taaki TypeScript koi error na de
 }
 
 /**

@@ -26,18 +26,18 @@ const VALID_STATUSES: SosAlert['status'][] = ['active', 'acknowledged', 'resolve
 const VALID_TEAM_STATUSES: NonNullable<SosAlert['assigned_team_status']>[] = ['on_call', 'dispatched', 'standby'];
 
 function toSeverity(raw: string): RiskLevel {
-  const v = raw.toLowerCase();
+  const v = raw ? String(raw).toLowerCase() : "";
   return (VALID_SEVERITIES as string[]).includes(v) ? (v as RiskLevel) : 'low';
 }
 
 function toStatus(raw: string): SosAlert['status'] {
-  const v = raw.toLowerCase();
+  const v = raw ? String(raw).toLowerCase() : "";
   return (VALID_STATUSES as string[]).includes(v) ? (v as SosAlert['status']) : 'active';
 }
 
 function toTeamStatus(raw: string | null): SosAlert['assigned_team_status'] {
   if (raw == null) return null;
-  const v = raw.toLowerCase();
+  const v = raw ? String(raw).toLowerCase() : "";
   return (VALID_TEAM_STATUSES as string[]).includes(v) ? (v as SosAlert['assigned_team_status']) : null;
 }
 

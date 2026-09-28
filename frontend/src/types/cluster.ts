@@ -43,7 +43,7 @@ export interface AdjacentFacility {
 export interface Esp32Telemetry {
   temperature_c: number | null;
   humidity_pct: number | null;
-  smoke_level: 'low' | 'medium' | 'high' | null;
+  smoke_level: string | null; // isko string | null kar dena taaki koi bhi string error na de
 }
 
 /**

@@ -42,7 +42,11 @@ export function DetailPanel({ cluster, onClose }: DetailPanelProps) {
       <div className="flex flex-col gap-3.5">
         <RiskHighlightCard cluster={cluster} />
         <PersistenceHighlightCard persistenceScore={cluster.persistence_score} durationHours={cluster.duration_hours} />
-        <EspTelemetryCard esp32={cluster.esp32} />
+        <EspTelemetryCard 
+        esp32={cluster.esp32} 
+        espData={(cluster as any).esp_live_data} 
+        isGroundNode={cluster.cluster_id === 'NODE_SMB_01'} 
+        />
 
         <Section
           title="AI classification"
