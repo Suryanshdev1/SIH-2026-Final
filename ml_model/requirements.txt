@@ -13,3 +13,4 @@ joblib>=1.4,<2
 tensorflow>=2.16,<2.18
 requests>=2.32,<3
 apscheduler>=3.10,<4
+gdown>=5.1.0
