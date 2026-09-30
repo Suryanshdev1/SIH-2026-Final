@@ -14,6 +14,9 @@ from pathlib import Path
 from pydantic import BaseModel
 from datetime import datetime
 
+import gdown
+import zipfile
+
 from datetime import datetime, timezone
 
 import subprocess
@@ -83,6 +86,30 @@ def trigger_automated_pipeline():
 async def lifespan(app: FastAPI):
     global fire_engine, fire_engine_error
     
+    # 🚀 PATH FIX: '..' ka matlab ek folder piche (root) check karo
+    base_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    data_dir = os.path.join(base_dir, "data")
+    zip_path = os.path.join(base_dir, "heavy_data.zip")
+    worldcover_path = os.path.join(data_dir, "worldcover")
+    
+    if not os.path.exists(worldcover_path):
+        print("Starting heavy data download from Google Drive...")
+        os.makedirs(data_dir, exist_ok=True)
+        
+        file_id = "1oT6dTaHtQ099w1VZzGsTUcRBTcEnFfts" # Teri file ID
+        gdown.download(id=file_id, output=zip_path, quiet=False)
+        
+        print("Extracting files...")
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(base_dir) # Root mein extract karega
+            
+        if os.path.exists(zip_path):
+            os.remove(zip_path)
+        print("Data is ready for the ML pipeline!")
+    else:
+        print("✅ Heavy data found locally. Skipping download.")
+        
+    # 🚀 PURANA CODE YAHAN SE CONTINUE...
     try:
         fire_engine = FireAnalysisEngine(artifacts_dir=str(ARTIFACTS_DIR))
         print("AI models loaded successfully.")
@@ -230,7 +257,7 @@ def health():
         "model_error": fire_engine_error,
         "database_reachable": db_ok,
         "database_error": db_error,
-        "database": DB_NAME,
+        "database": "Supabase PostgreSQL",  # Yahan DB_NAME hata kar safe string daal di
         "table": DB_TABLE,
     }
 
