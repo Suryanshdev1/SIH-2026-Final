@@ -11,6 +11,9 @@ import { SosArrivalBanner } from '@/components/alerts/SosArrivalBanner';
 import { SosAlertModal } from '@/components/alerts/SosAlertModal';
 
 export default function App() {
+  // 🔥 NAYA CODE: Vercel ka inject kiya hua URL check karne ke liye
+  console.log("🔥 API URL FROM VERCEL:", import.meta.env.VITE_API_BASE_URL);
+
   return (
     <NotificationProvider>
       {/* Deep-teal frame around a single rounded shell: masthead across the
