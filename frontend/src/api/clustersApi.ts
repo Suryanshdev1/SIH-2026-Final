@@ -3,7 +3,8 @@ import { mockClusters } from '@/mock/clusters';
 import { toThermalClusters, type ThermalMapResponse, type BackendErrorResponse } from './adapters';
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000';
-const USE_MOCK = import.meta.env.VITE_USE_MOCK !== 'false';
+// 🔥 FIX: Hamesha backend se real data layega
+const USE_MOCK = false;
 const NETWORK_DELAY_MS = 550;
 
 // 🚀 GLOBAL CACHE & PROMISE TRACKER

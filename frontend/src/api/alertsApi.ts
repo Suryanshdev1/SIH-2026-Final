@@ -4,7 +4,8 @@ import { mockAlerts } from '@/mock/alerts';
 import { toSosAlerts, type BackendAlert } from './alertsAdapters';
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL ?? 'http://localhost:8000';
-const USE_MOCK = import.meta.env.VITE_USE_MOCK !== 'false';
+// 🔥 FIX: Hamesha API call karega, mock completely disable kar diya
+const USE_MOCK = false;
 
 const NETWORK_DELAY_MS = 450;
 
